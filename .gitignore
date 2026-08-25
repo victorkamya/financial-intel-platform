@@ -1,0 +1,17 @@
+infra-deploy/.env
+infra-deploy/outputs.json
+infra-deploy/venv/
+infra-deploy/__pycache__/
+infra-deploy/set-env.ps1
+
+.claude/
+
+# already its own separate repo (github.com/victorkamya/terraform-databricks) — don't duplicate here
+terraform-databricks/
+
+# ml-pipeline (Python pipeline code — safety net for future stages)
+ml-pipeline/**/__pycache__/
+ml-pipeline/**/*.pyc
+ml-pipeline/**/venv/
+ml-pipeline/**/.venv/
+**/.env

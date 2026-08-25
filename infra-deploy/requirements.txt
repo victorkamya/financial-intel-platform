@@ -1,0 +1,3 @@
+boto3>=1.34
+databricks-sdk>=0.30
+python-dotenv>=1.0
