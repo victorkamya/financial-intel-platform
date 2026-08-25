@@ -4,10 +4,12 @@ boto3 (AWS) + databricks-sdk (existing us-west-2 workspace/metastore).
 Run: python deploy.py
 """
 
+import io
 import json
 import os
 import random
 import string
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +38,8 @@ REQUIRED_ENV_VARS = [
     # breaking workspace-level auth. We only need this as a plain string
     # for the Unity Catalog IAM trust policy's ExternalId, not for auth.
     "DATABRICKS_METASTORE_ID",
+    "ALPACA_API_KEY",
+    "ALPACA_SECRET_KEY",
 ]
 
 
@@ -151,6 +155,7 @@ kinesis = boto3.client("kinesis", region_name=PRIMARY_REGION)
 secretsmanager = boto3.client("secretsmanager", region_name=PRIMARY_REGION)
 iam = boto3.client("iam")
 cloudwatch = boto3.client("cloudwatch", region_name=PRIMARY_REGION)
+lambda_client = boto3.client("lambda", region_name=PRIMARY_REGION)
 
 w = WorkspaceClient()  # reads DATABRICKS_HOST / DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET
 
@@ -596,6 +601,222 @@ def create_databricks_objects() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STEP 10: ALPACA API SECRET (Stage 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_alpaca_secret() -> str:
+    print("\n--- Step 10: Alpaca API secret ---")
+    # Name must match the wildcard already granted to the databricks-boto3-runtime
+    # IAM user (arn:...:secret:<prefix>/alpaca_api-*) — Secrets Manager appends a
+    # random suffix automatically, which still satisfies that wildcard.
+    secret_id = f"{PREFIX}/alpaca_api"
+
+    if secret_exists(secret_id):
+        print(f"  [skip] secret already exists: {secret_id}")
+    else:
+        secretsmanager.create_secret(
+            Name=secret_id,
+            SecretString=json.dumps({
+                "api_key": require_env("ALPACA_API_KEY"),
+                "api_secret": require_env("ALPACA_SECRET_KEY"),
+            }),
+            Tags=aws_tag_list(COMMON_TAGS),
+        )
+        print(f"  [ok]   created secret: {secret_id}")
+
+    secret_arn = secretsmanager.describe_secret(SecretId=secret_id)["ARN"]
+    record_resource(OUTPUTS, "alpaca_api_secret_arn", secret_arn)
+
+    return secret_arn
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 11: LAMBDA DLQ HANDLER + KINESIS EVENT SOURCE MAPPING (Stage 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DLQ_S3_PREFIX = "dlq"
+
+# __DLQ_BUCKET__ is substituted with the real bronze bucket name before
+# deployment — using .replace() rather than .format() so the handler's own
+# f-strings don't need brace-escaping.
+LAMBDA_DLQ_CODE_TEMPLATE = '''
+import json
+import boto3
+import base64
+from datetime import datetime, timezone
+
+s3 = boto3.client("s3")
+DLQ_BUCKET = "__DLQ_BUCKET__"
+DLQ_PREFIX = "__DLQ_PREFIX__"
+
+
+def handler(event, context):
+    """Route malformed Kinesis market-data records to an S3 DLQ prefix."""
+    failed_records = []
+
+    for record in event["Records"]:
+        try:
+            payload = json.loads(base64.b64decode(record["kinesis"]["data"]))
+            if not payload.get("symbol") or not payload.get("price"):
+                raise ValueError(f"Missing required fields: {payload}")
+        except Exception as e:
+            failed_records.append({
+                "record": record,
+                "error": str(e),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+    if failed_records:
+        key = f"{DLQ_PREFIX}/{datetime.now(timezone.utc).strftime('%Y/%m/%d/%H')}/failed_{context.aws_request_id}.json"
+        s3.put_object(
+            Bucket=DLQ_BUCKET,
+            Key=key,
+            Body=json.dumps(failed_records),
+        )
+
+    return {"statusCode": 200, "failed_count": len(failed_records)}
+'''
+
+
+def lambda_function_exists(name: str) -> bool:
+    try:
+        lambda_client.get_function(FunctionName=name)
+        return True
+    except lambda_client.exceptions.ResourceNotFoundException:
+        return False
+
+
+def find_event_source_mapping(function_name: str, stream_arn: str):
+    for esm in lambda_client.list_event_source_mappings(FunctionName=function_name)["EventSourceMappings"]:
+        if esm["EventSourceArn"] == stream_arn:
+            return esm["UUID"]
+    return None
+
+
+def create_lambda_dlq(bronze_bucket: str, stream_arn: str) -> dict:
+    print("\n--- Step 11: Lambda DLQ handler ---")
+    log_event(OUTPUTS, "step11", "start", "creating lambda-dlq-role, function, and Kinesis event source mapping")
+
+    role_name = f"{PREFIX}-lambda-dlq-role"
+    trust_policy = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }],
+    }
+    role_arn = create_role_if_not_exists(role_name, trust_policy)
+
+    exec_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "kinesis:GetRecords", "kinesis:GetShardIterator",
+                    "kinesis:DescribeStream", "kinesis:DescribeStreamSummary",
+                    "kinesis:ListShards", "kinesis:ListStreams",
+                ],
+                "Resource": stream_arn,
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:PutObject"],
+                "Resource": f"arn:aws:s3:::{bronze_bucket}/{DLQ_S3_PREFIX}/*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": "arn:aws:logs:*:*:*",
+            },
+        ],
+    }
+    put_inline_policy(role_name, f"{PREFIX}-lambda-dlq-policy", exec_policy)
+
+    function_name = f"{PREFIX}-kinesis-dlq-handler"
+    lambda_code = (
+        LAMBDA_DLQ_CODE_TEMPLATE
+        .replace("__DLQ_BUCKET__", bronze_bucket)
+        .replace("__DLQ_PREFIX__", DLQ_S3_PREFIX)
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("lambda_function.py", lambda_code)
+    zip_bytes = buf.getvalue()
+
+    if lambda_function_exists(function_name):
+        lambda_client.update_function_code(FunctionName=function_name, ZipFile=zip_bytes)
+        print(f"  [skip] function already exists (code refreshed): {function_name}")
+    else:
+        last_err = None
+        for attempt in range(10):
+            try:
+                lambda_client.create_function(
+                    FunctionName=function_name,
+                    Runtime="python3.12",
+                    Role=role_arn,
+                    Handler="lambda_function.handler",
+                    Code={"ZipFile": zip_bytes},
+                    Timeout=30,
+                    MemorySize=128,
+                    Description="Routes malformed Kinesis market-data records to an S3 DLQ prefix",
+                    # No Tags param: financial-intel-deploy lacks lambda:TagResource,
+                    # and the PREFIX naming convention already identifies ownership.
+                )
+                print(f"  [ok]   created function: {function_name}")
+                last_err = None
+                break
+            except ClientError as e:
+                last_err = e
+                code = e.response["Error"]["Code"]
+                if code == "InvalidParameterValueException" and "cannot be assumed" in str(e).lower():
+                    print(f"  [retry] role not yet assumable (attempt {attempt + 1}), waiting 5s...")
+                    time.sleep(5)
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+
+    function_arn = lambda_client.get_function(FunctionName=function_name)["Configuration"]["FunctionArn"]
+    record_resource(OUTPUTS, "lambda_dlq_function_arn", function_arn)
+    record_resource(OUTPUTS, "lambda_dlq_role_arn", role_arn)
+    record_resource(OUTPUTS, "dlq_s3_location", f"s3://{bronze_bucket}/{DLQ_S3_PREFIX}/")
+
+    esm_uuid = find_event_source_mapping(function_name, stream_arn)
+    if esm_uuid:
+        print(f"  [skip] event source mapping already exists: {esm_uuid}")
+    else:
+        last_err = None
+        for attempt in range(10):
+            try:
+                resp = lambda_client.create_event_source_mapping(
+                    EventSourceArn=stream_arn,
+                    FunctionName=function_name,
+                    StartingPosition="LATEST",
+                    BatchSize=10,
+                )
+                esm_uuid = resp["UUID"]
+                print(f"  [ok]   created event source mapping: {esm_uuid}")
+                last_err = None
+                break
+            except ClientError as e:
+                last_err = e
+                if e.response["Error"]["Code"] == "InvalidParameterValueException":
+                    print(f"  [retry] function/role not yet ready for ESM (attempt {attempt + 1}), waiting 5s...")
+                    time.sleep(5)
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+
+    record_resource(OUTPUTS, "lambda_dlq_event_source_mapping_uuid", esm_uuid)
+    log_event(OUTPUTS, "step11", "complete", f"function={function_arn} esm={esm_uuid}")
+
+    return {"function_arn": function_arn, "role_arn": role_arn, "esm_uuid": esm_uuid}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 9: WRAP-UP
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -628,7 +849,21 @@ if __name__ == "__main__":
     cw_resources = create_cloudwatch_resources(stream_name)
     print("\nCloudWatch:", json.dumps(cw_resources, indent=2))
 
-    databricks_objects = create_databricks_objects()
-    print("\nDatabricks objects recorded in outputs.json")
+    alpaca_secret_arn = create_alpaca_secret()
+    print("\nAlpaca API secret ARN:", alpaca_secret_arn)
+
+    stream_arn = OUTPUTS["resources"]["kinesis_stream_arn"]
+    lambda_dlq = create_lambda_dlq(buckets["bronze"], stream_arn)
+    print("\nLambda DLQ:", json.dumps(lambda_dlq, indent=2))
+
+    try:
+        databricks_objects = create_databricks_objects()
+        print("\nDatabricks objects recorded in outputs.json")
+    except Exception as e:
+        # Don't let a broken overarching-sp OAuth credential (unrelated to
+        # this run's AWS work above) block everything else — catalogs/schemas
+        # were already confirmed manually during Phase 0 anyway.
+        print(f"\n  [warn] Step 8 (Databricks catalogs/schemas/groups) failed, continuing: {e}")
+        log_event(OUTPUTS, "step8", "error", str(e))
 
     wrap_up()
