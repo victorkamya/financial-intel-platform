@@ -99,15 +99,17 @@ print(f"Vector store built at {VECTOR_STORE_PATH}")
 # COMMAND ----------
 
 import mlflow.pyfunc
+import pandas as pd
 # AgentExecutor / create_openai_tools_agent were deprecated in LangChain 0.2
 # (moved to the legacy langchain-classic package). Current LangChain (v1)
 # builds agents on LangGraph via create_agent instead.
 from langchain.agents import create_agent
 from langchain.tools import tool
 from databricks_langchain import ChatDatabricks
-from pyspark.sql import SparkSession
+from databricks.sdk import WorkspaceClient
 
 CHAT_ENDPOINT = "databricks-meta-llama-3-1-8b-instruct"
+WAREHOUSE_ID = "9e3e387ce215ee34"
 
 SYSTEM_PROMPT = (
     "You are a senior financial analyst. Use the available tools to "
@@ -121,7 +123,13 @@ class FinancialAnalystAgent(mlflow.pyfunc.PythonModel):
     """MLflow PythonModel wrapping a LangChain agent, registered to Unity Catalog."""
 
     def load_context(self, context):
-        self.spark = SparkSession.builder.getOrCreate()
+        # Model Serving containers have no local Spark session (that's only
+        # available inside notebooks/jobs on an actual cluster) — confirmed
+        # via "RuntimeError: Only remote Spark sessions using Databricks
+        # Connect are supported" when this used SparkSession.builder. Using
+        # the SQL Statement Execution API via databricks-sdk instead, which
+        # works the same way regardless of whether Spark is available.
+        self.w = WorkspaceClient()
         self.vector_store = Chroma(
             persist_directory=context.artifacts["vector_store_path"],
             embedding_function=DatabricksEmbeddings(endpoint=EMBEDDING_ENDPOINT),
@@ -130,13 +138,25 @@ class FinancialAnalystAgent(mlflow.pyfunc.PythonModel):
         self.retriever = self.vector_store.as_retriever(search_kwargs={"k": 6})
         self.agent = self._build_agent()
 
+    def _sql_to_df(self, statement: str) -> pd.DataFrame:
+        resp = self.w.statement_execution.execute_statement(
+            statement=statement,
+            warehouse_id=WAREHOUSE_ID,
+            wait_timeout="30s",
+        )
+        if resp.status.state.value != "SUCCEEDED":
+            raise RuntimeError(f"SQL statement failed: {resp.status.error}")
+        columns = [c.name for c in resp.manifest.schema.columns]
+        rows = resp.result.data_array or []
+        return pd.DataFrame(rows, columns=columns)
+
     def _build_agent(self):
         llm = ChatDatabricks(endpoint=CHAT_ENDPOINT, max_tokens=2048)
 
         @tool
         def search_sec_filings(query: str) -> str:
             """Search indexed SEC 10-K filings for relevant financial information."""
-            docs = self.retriever.get_relevant_documents(query)
+            docs = self.retriever.invoke(query)
             return "\n\n".join([
                 f"[{d.metadata.get('ticker', '?')} | {d.metadata.get('source_file', '?')}]\n{d.page_content}"
                 for d in docs
@@ -145,14 +165,13 @@ class FinancialAnalystAgent(mlflow.pyfunc.PythonModel):
         @tool
         def get_price_history(ticker: str, days: int = 30) -> str:
             """Fetch recent daily OHLCV price data from the gold layer for a ticker."""
-            df = self.spark.sql(f"""
+            pdf = self._sql_to_df(f"""
                 SELECT trade_date, open, high, low, close, volume
                 FROM gold.market_data.gold_fact_daily_ohlcv
                 WHERE symbol = '{ticker.upper()}'
                 ORDER BY trade_date DESC
                 LIMIT {days}
             """)
-            pdf = df.toPandas()
             if pdf.empty:
                 return f"No price history available yet for {ticker.upper()}."
             return pdf.to_string(index=False)
@@ -160,13 +179,12 @@ class FinancialAnalystAgent(mlflow.pyfunc.PythonModel):
         @tool
         def get_current_positions(account_id: str = "PA3C0H606N6M") -> str:
             """Fetch the current open positions (symbol, quantity, avg cost) for a paper trading account."""
-            df = self.spark.sql(f"""
+            pdf = self._sql_to_df(f"""
                 SELECT symbol, quantity, avg_cost, event_timestamp
                 FROM silver.market_data.silver_positions_current
                 WHERE account_id = '{account_id}'
                 ORDER BY symbol
             """)
-            pdf = df.toPandas()
             if pdf.empty:
                 return f"No open positions found for account {account_id}."
             return pdf.to_string(index=False)
@@ -196,6 +214,7 @@ with mlflow.start_run(run_name="rag_agent_v1") as run:
     import pandas as pd
     from mlflow.models.signature import ModelSignature
     from mlflow.types.schema import ColSpec, Schema
+    from mlflow.models.resources import DatabricksSQLWarehouse, DatabricksServingEndpoint
 
     signature = ModelSignature(
         inputs=Schema([ColSpec("string", "query")]),
@@ -210,11 +229,23 @@ with mlflow.start_run(run_name="rag_agent_v1") as run:
         registered_model_name="ml.models.financial_analyst_agent",
         signature=signature,
         input_example=input_example,
+        # Declares the model's SQL warehouse dependency so Databricks Model
+        # Serving auto-provisions and injects scoped credentials for it at
+        # runtime ("automatic authentication passthrough") — a plain
+        # WorkspaceClient() in a serving container otherwise has no
+        # ambient credentials (confirmed via "ValueError: default auth:
+        # cannot configure default credentials").
+        resources=[
+            DatabricksSQLWarehouse(warehouse_id=WAREHOUSE_ID),
+            DatabricksServingEndpoint(endpoint_name=CHAT_ENDPOINT),
+            DatabricksServingEndpoint(endpoint_name=EMBEDDING_ENDPOINT),
+        ],
         pip_requirements=[
             "langchain",
             "langchain-community",
             "langchain-text-splitters",
             "databricks-langchain",
+            "databricks-sdk",
             "chromadb",
         ],
     )
