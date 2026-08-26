@@ -29,7 +29,20 @@ VALUES
   ('PA3C0H606N6M', 'MSFT', 0,  0.0,    'DELETE', TIMESTAMP'2026-08-25 15:50:00'),
   ('PA3C0H606N6M', 'NVDA', 20, 119.40, 'UPSERT', TIMESTAMP'2026-08-25 16:10:00');
 
+-- Additional scenarios: a partial trim (GOOGL, quantity decreases via UPSERT
+-- rather than a DELETE), a simple buy-and-hold (AMZN), and a reopen-after-close
+-- (MSFT bought again after its DELETE above) — broader CDC coverage than the
+-- original close/no-close-only scenario.
+INSERT INTO bronze.market_data.position_changes
+  (account_id, symbol, quantity, avg_cost, operation, event_timestamp)
+VALUES
+  ('PA3C0H606N6M', 'GOOGL', 30, 168.20, 'UPSERT', TIMESTAMP'2026-08-21 09:45:00'),
+  ('PA3C0H606N6M', 'AMZN',  18, 178.50, 'UPSERT', TIMESTAMP'2026-08-22 11:00:00'),
+  ('PA3C0H606N6M', 'GOOGL', 15, 169.00, 'UPSERT', TIMESTAMP'2026-08-23 14:10:00'),
+  ('PA3C0H606N6M', 'MSFT',  10, 415.00, 'UPSERT', TIMESTAMP'2026-08-26 09:40:00');
+
 -- Expected final state in silver.market_data.silver_positions_current after
--- the pipeline runs: AAPL 15 @ 227.90, NVDA 20 @ 119.40 (MSFT and TSLA absent,
--- deleted per the sequence above, keyed by account_id+symbol, sequenced by
--- event_timestamp).
+-- the pipeline runs (keyed by account_id+symbol, sequenced by
+-- event_timestamp): AAPL 15 @ 227.90, NVDA 20 @ 119.40, GOOGL 15 @ 169.00,
+-- AMZN 18 @ 178.50, MSFT 10 @ 415.00 (reopened after its earlier DELETE).
+-- TSLA remains absent (deleted, never reopened).
