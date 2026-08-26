@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import boto3
+from botocore.exceptions import ClientError
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType
@@ -107,6 +108,32 @@ class KinesisTradeIngester(BaseIngester):
                     ShardIteratorType="LATEST",
                 )["ShardIterator"]
 
+    def _refresh_iterator(self, shard_id: str) -> Optional[str]:
+        try:
+            return kinesis.get_shard_iterator(
+                StreamName=self.stream_name,
+                ShardId=shard_id,
+                ShardIteratorType="LATEST",
+            )["ShardIterator"]
+        except ClientError as e:
+            print(f"[warn] could not refresh iterator for shard {shard_id}: {e}")
+            return None
+
+    @staticmethod
+    def _is_valid_trade(rec: dict) -> bool:
+        # Payload validation is deliberately duplicated with the Lambda DLQ
+        # handler (which routes the same malformed records to S3 for
+        # reprocessing) — here it just needs to not crash createDataFrame.
+        try:
+            return (
+                isinstance(rec.get("symbol"), str) and rec["symbol"]
+                and isinstance(rec.get("price"), (int, float))
+                and isinstance(rec.get("size"), (int, float))
+                and isinstance(rec.get("timestamp"), str) and rec["timestamp"]
+            )
+        except AttributeError:
+            return False
+
     def read(self) -> Optional[DataFrame]:
         self._ensure_iterators()
         records = []
@@ -115,13 +142,28 @@ class KinesisTradeIngester(BaseIngester):
         while time.time() < end_time:
             for shard_id, iterator in list(self._shard_iterators.items()):
                 if iterator is None:
+                    iterator = self._refresh_iterator(shard_id)
+                    self._shard_iterators[shard_id] = iterator
+                    if iterator is None:
+                        continue
+                try:
+                    resp = kinesis.get_records(ShardIterator=iterator, Limit=1000)
+                except ClientError as e:
+                    code = e.response["Error"]["Code"]
+                    if code == "ExpiredIteratorException":
+                        print(f"[warn] iterator expired for shard {shard_id}, refreshing")
+                        self._shard_iterators[shard_id] = self._refresh_iterator(shard_id)
+                    else:
+                        print(f"[warn] get_records failed for shard {shard_id} ({code}), will retry next cycle")
                     continue
-                resp = kinesis.get_records(ShardIterator=iterator, Limit=1000)
+
                 for rec in resp["Records"]:
                     try:
-                        records.append(json.loads(rec["Data"]))
+                        payload = json.loads(rec["Data"])
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue  # malformed records are routed to the DLQ Lambda separately
+                    if self._is_valid_trade(payload):
+                        records.append(payload)
                 self._shard_iterators[shard_id] = resp.get("NextShardIterator")
             time.sleep(2)
 
@@ -144,8 +186,14 @@ config = IngestionConfig(
 ingester = KinesisTradeIngester(spark, config, KINESIS_STREAM, poll_seconds=30)
 
 print(f"Starting continuous Kinesis -> bronze.market_data.raw_trades consumption "
-      f"(poll window {ingester.poll_seconds}s). Cancel the job run to stop.")
+      f"(poll window {ingester.poll_seconds}s). Runs until the job's timeout stops it.")
 while True:
-    n = ingester.run()
-    if n:
-        print(f"Wrote {n} record(s) to bronze.market_data.raw_trades")
+    try:
+        n = ingester.run()
+        if n:
+            print(f"Wrote {n} record(s) to bronze.market_data.raw_trades")
+    except Exception as e:
+        # One bad micro-batch (a transient write conflict, an unexpected
+        # Kinesis error not already handled in read()) shouldn't end the
+        # whole job early within its scheduled window — log and keep polling.
+        print(f"[warn] micro-batch failed, continuing: {e}")

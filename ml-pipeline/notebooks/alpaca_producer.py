@@ -51,26 +51,32 @@ stream = StockDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY, feed=DataFeed.IEX)
 
 
 async def on_trade(trade) -> None:
-    payload = {
-        "symbol": trade.symbol,
-        "price": float(trade.price),
-        "size": int(trade.size),
-        "timestamp": trade.timestamp.isoformat(),
-        "exchange": trade.exchange,
-        "conditions": ",".join(trade.conditions) if trade.conditions else None,
-    }
-    body = json.dumps(payload).encode("utf-8")
+    # A single bad tick (unexpected field shape, a transient boto3/network
+    # error) must never take down the whole websocket subscription — log and
+    # move on to the next trade instead of letting the exception propagate.
+    try:
+        payload = {
+            "symbol": trade.symbol,
+            "price": float(trade.price),
+            "size": int(trade.size),
+            "timestamp": trade.timestamp.isoformat(),
+            "exchange": trade.exchange,
+            "conditions": ",".join(trade.conditions) if trade.conditions else None,
+        }
+        body = json.dumps(payload).encode("utf-8")
 
-    kinesis.put_record(
-        StreamName=KINESIS_STREAM,
-        Data=body,
-        PartitionKey=payload["symbol"],
-    )
+        kinesis.put_record(
+            StreamName=KINESIS_STREAM,
+            Data=body,
+            PartitionKey=payload["symbol"],
+        )
 
-    # Independent of the Kinesis path — cheap raw replay/audit archive.
-    now = datetime.now(timezone.utc)
-    key = f"{RAW_ARCHIVE_PREFIX}/{now:%Y/%m/%d/%H}/{payload['symbol']}_{now.timestamp()}.json"
-    s3.put_object(Bucket=BRONZE_BUCKET, Key=key, Body=body)
+        # Independent of the Kinesis path — cheap raw replay/audit archive.
+        now = datetime.now(timezone.utc)
+        key = f"{RAW_ARCHIVE_PREFIX}/{now:%Y/%m/%d/%H}/{payload['symbol']}_{now.timestamp()}.json"
+        s3.put_object(Bucket=BRONZE_BUCKET, Key=key, Body=body)
+    except Exception as e:
+        print(f"[warn] on_trade failed for {getattr(trade, 'symbol', '?')}: {e}")
 
 
 for symbol in WATCHLIST:
@@ -85,5 +91,12 @@ import nest_asyncio
 nest_asyncio.apply()
 
 print(f"Streaming trades for {WATCHLIST} -> Kinesis stream {KINESIS_STREAM}")
-print("This runs until the job is manually cancelled.")
-stream.run()
+print("This runs until the job's timeout stops it.")
+try:
+    stream.run()
+except Exception as e:
+    # The job's timeout_seconds is what's expected to end this run (it kills
+    # the process externally, not catchable here) — this except is for
+    # genuine in-code failures (auth, connection setup) so they end the
+    # notebook cleanly instead of an unhandled-exception traceback.
+    print(f"[warn] stream.run() exited with an error: {e}")
