@@ -499,6 +499,21 @@ def create_cloudwatch_resources(stream_name: str) -> dict:
                     "stat": "Sum",
                 },
             },
+            {
+                "type": "metric",
+                "properties": {
+                    # Matches the deterministic name create_lambda_dlq() uses
+                    # (f"{PREFIX}-kinesis-dlq-handler") -- referenced by name
+                    # here rather than passed in, since this step historically
+                    # runs before the Lambda step in __main__ and the metric
+                    # simply reads as empty until the function exists.
+                    "title": "Lambda DLQ Handler — Errors",
+                    "metrics": [["AWS/Lambda", "Errors", "FunctionName", f"{PREFIX}-kinesis-dlq-handler"]],
+                    "region": PRIMARY_REGION,
+                    "period": 300,
+                    "stat": "Sum",
+                },
+            },
         ],
     }
     cloudwatch.put_dashboard(
