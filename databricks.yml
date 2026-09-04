@@ -1,0 +1,16 @@
+bundle:
+  name: financial-intel-platform
+
+include:
+  - resources/*.yml
+
+variables:
+  databricks_host:
+    description: Databricks workspace URL
+    default: https://<your-workspace-id>.cloud.databricks.com
+
+targets:
+  default:
+    default: true
+    workspace:
+      host: ${var.databricks_host}

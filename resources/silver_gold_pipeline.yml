@@ -1,0 +1,11 @@
+resources:
+  pipelines:
+    market_data_silver_gold:
+      name: market-data-silver-gold
+      catalog: gold
+      target: market_data
+      serverless: true
+      continuous: false
+      libraries:
+        - notebook:
+            path: ../ml-pipeline/notebooks/dlt_market_data_pipeline.py

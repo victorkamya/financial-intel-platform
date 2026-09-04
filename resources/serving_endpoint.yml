@@ -1,0 +1,13 @@
+resources:
+  model_serving_endpoints:
+    financial_analyst_agent:
+      name: financial-analyst-agent
+      config:
+        served_entities:
+          - entity_name: ml.models.financial_analyst_agent
+            entity_version: "4"
+            scale_to_zero_enabled: true
+            workload_size: Small
+            environment_vars:
+              DATABRICKS_HOST: "{{secrets/databricks-serving-creds/host}}"
+              DATABRICKS_TOKEN: "{{secrets/databricks-serving-creds/token}}"

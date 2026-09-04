@@ -1,0 +1,9 @@
+resources:
+  jobs:
+    build_rag_agent:
+      name: build-rag-agent
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: build_rag_agent
+          notebook_task:
+            notebook_path: ../ml-pipeline/notebooks/build_rag_agent.py
